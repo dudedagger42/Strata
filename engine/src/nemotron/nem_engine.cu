@@ -16,6 +16,15 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -576,6 +585,29 @@ bool load(const std::string& path, Model& m, std::string& err, int head_mode /* 
         m.embd = gm.shard(s).tensor_data(*t);
     }
     m.n_head = m.n_head > 0 ? m.n_head : 32;
+#if defined(_WIN32)
+    // the experts into RAM now, in large sequential reads (PrefetchVirtualMemory), not page by page during the first tokens
+    if (!std::getenv("STRATA_NEMOTRON_NO_PREFETCH")) {
+        const auto p0 = Clock::now();
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> rs;
+        size_t total = 0;
+        for (const Layer& y : m.layers) {
+            if (y.kind != Kind::Moe) continue;
+            const size_t ub = (size_t) y.n_expert * y.n_ff * y.ex.up_row, db = (size_t) y.n_expert * m.n_lat * y.ex.down_row;
+            rs.push_back({(PVOID) y.ex.up, ub});
+            rs.push_back({(PVOID) y.ex.down, db});
+            total += ub + db;
+        }
+        const BOOL ok = PrefetchVirtualMemory(GetCurrentProcess(), rs.size(), rs.data(), 0);
+        // the call only queues the reads: touch one byte per page so the load returns with the experts resident
+        volatile uint8_t sink = 0;
+        for (const auto& r : rs)
+            for (size_t o = 0; o < r.NumberOfBytes; o += 4096) sink ^= ((const volatile uint8_t*) r.VirtualAddress)[o];
+        (void) sink;
+        std::fprintf(stderr, "strata-nemotron: %.1f GiB of experts read into RAM in %.1f s (prefetch %s)\n",
+                     total / 1073741824.0, ms_since(p0) / 1000.0, ok ? "on" : "refused");
+    }
+#endif
     if (const auto* v = meta(gm, "tokenizer.ggml.eos_token_id")) m.eos.push_back((int) v->num());
     if (const auto* v = meta(gm, "tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
         for (size_t i = 0; i < v->items.size() && i < 1000; ++i) {
@@ -1116,7 +1148,7 @@ int strata_nemotron_main(int argc, char** argv) {
         Serve sv(E);
         return sv.run();
     }
-    if (const char* bp = arg(argc, argv, "--bench-pp")) {
+    auto run_bench = [&](const char* bp) {
         const int npp = std::atoi(bp);
         const int ntg = arg(argc, argv, "--bench-tg") ? std::atoi(arg(argc, argv, "--bench-tg")) : 64;
         const int reps = arg(argc, argv, "--reps") ? std::atoi(arg(argc, argv, "--reps")) : 2;
@@ -1143,6 +1175,73 @@ int strata_nemotron_main(int argc, char** argv) {
             std::fflush(stdout);
         }
         return 0;
+    };
+    if (const char* bp = arg(argc, argv, "--bench-pp"); bp && !arg(argc, argv, "--prompts")) return run_bench(bp);
+    if (const char* pf = arg(argc, argv, "--prompts")) {
+        // one line of comma-separated ids per prompt; per prompt: "P i", "gen: ...", "top s: id:logprob ..." (one load)
+        FILE* f = std::fopen(pf, "rb");
+        if (!f) { std::fprintf(stderr, "strata-nemotron: cannot read %s\n", pf); return 1; }
+        std::string all;
+        char buf[65536];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
+        std::fclose(f);
+        const int ngen = arg(argc, argv, "--n") ? std::atoi(arg(argc, argv, "--n")) : 64;
+        const int top = arg(argc, argv, "--top") ? std::atoi(arg(argc, argv, "--top")) : 20;
+        const int top_steps = arg(argc, argv, "--top-steps") ? std::atoi(arg(argc, argv, "--top-steps")) : 8;
+        size_t a0 = 0;
+        int pi_ = 0;
+        std::vector<float> lg;
+        while (a0 < all.size()) {
+            size_t e = all.find('\n', a0);
+            if (e == std::string::npos) e = all.size();
+            const std::string line = all.substr(a0, e - a0);
+            a0 = e + 1;
+            const std::vector<int32_t> ids = parse_ids(line.c_str());
+            if (ids.empty()) continue;
+            E.reset();
+            E.cpu_ms = 0;
+            const auto t0 = Clock::now();
+            E.process(ids.data(), (int64_t) ids.size(), [](int64_t) { return true; });
+            E.greedy();
+            const double pp_ms = ms_since(t0);
+            std::vector<int32_t> gen;
+            std::string tops;
+            const auto d0 = Clock::now();
+            for (int i = 0; i < ngen; ++i) {
+                if (top > 0 && i < top_steps) {
+                    E.host_logits(lg);
+                    const float mx = *std::max_element(lg.begin(), lg.end());
+                    double s = 0;
+                    for (float v : lg) s += std::exp((double) v - mx);
+                    const double lse = mx + std::log(s);
+                    std::vector<int> idx(lg.size());
+                    for (size_t j = 0; j < idx.size(); ++j) idx[j] = (int) j;
+                    std::partial_sort(idx.begin(), idx.begin() + top, idx.end(),
+                                      [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
+                    tops += "top " + std::to_string(i) + ":";
+                    for (int j = 0; j < top; ++j) {
+                        char b[64];
+                        std::snprintf(b, sizeof b, " %d:%.5f", idx[(size_t) j], (double) lg[(size_t) idx[(size_t) j]] - lse);
+                        tops += b;
+                    }
+                    tops += "\n";
+                }
+                const int nx = E.greedy();
+                gen.push_back(nx);
+                if (i + 1 < ngen) {
+                    const int32_t one = nx;
+                    E.forward(&one, 1);
+                }
+            }
+            const double tg_ms = ms_since(d0);
+            std::printf("P %d pp %zu %.1f tok/s tg %d %.2f tok/s\ngen:", pi_++, ids.size(), 1000.0 * ids.size() / pp_ms, ngen,
+                        1000.0 * ngen / tg_ms);
+            for (int t : gen) std::printf(" %d", t);
+            std::printf("\n%s", tops.c_str());
+            std::fflush(stdout);
+        }
+        return arg(argc, argv, "--bench-pp") ? run_bench(arg(argc, argv, "--bench-pp")) : 0;
     }
     if (const char* tk = arg(argc, argv, "--tokens")) {
         const std::vector<int32_t> ids = parse_ids(tk);
