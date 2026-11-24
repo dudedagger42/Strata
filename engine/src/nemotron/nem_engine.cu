@@ -396,6 +396,7 @@ struct Model {
     size_t embd_row = 0;
     std::vector<int> eos;
     size_t gpu_bytes = 0;
+    bool lock_experts = false;
 };
 
 bool mmvq_type_ok(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 2 || t == 6; }
@@ -424,7 +425,7 @@ int64_t meta_layer_int(const strata::GgufModel& gm, const std::string& k, int l,
 }
 
 bool load(const std::string& path, Model& m, std::string& err, int head_mode /* -1 auto, 0 GPU, 1 CPU */,
-          size_t reserve_mib) {
+          size_t reserve_mib, bool lock_experts) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -598,6 +599,11 @@ bool load(const std::string& path, Model& m, std::string& err, int head_mode /* 
             rs.push_back({(PVOID) y.ex.down, db});
             total += ub + db;
         }
+        if (m.head_cpu) {   // the head read on the CPU every token: the same treatment
+            const size_t hb = (size_t) m.head.n_out * (size_t) (m.head.n_in / 32) * 34;
+            rs.push_back({(PVOID) m.head_host, hb});
+            total += hb;
+        }
         const BOOL ok = PrefetchVirtualMemory(GetCurrentProcess(), rs.size(), rs.data(), 0);
         // the call only queues the reads: touch one byte per page so the load returns with the experts resident
         volatile uint8_t sink = 0;
@@ -607,6 +613,7 @@ bool load(const std::string& path, Model& m, std::string& err, int head_mode /* 
         std::fprintf(stderr, "strata-nemotron: %.1f GiB of experts read into RAM in %.1f s (prefetch %s)\n",
                      total / 1073741824.0, ms_since(p0) / 1000.0, ok ? "on" : "refused");
     }
+    m.lock_experts = lock_experts;   // the hot experts are locked after the warm-up (Engine::lock_hot)
 #endif
     if (const auto* v = meta(gm, "tokenizer.ggml.eos_token_id")) m.eos.push_back((int) v->num());
     if (const auto* v = meta(gm, "tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
@@ -655,7 +662,7 @@ struct Engine {
     // pinned host
     float *h_x = nullptr, *h_lat = nullptr, *h_lat_o = nullptr, *h_wts = nullptr, *h_logits = nullptr;
     int32_t *h_ids = nullptr, *h_amax = nullptr;
-    double cpu_ms = 0;
+    double cpu_ms = 0, head_ms = 0, wait_ms = 0;   // routed experts on the CPU, the head on the CPU, waiting for the GPU
 
     void init(Model& model, int ctx_, int chunk_, int threads) {
         m = &model;
@@ -818,10 +825,17 @@ struct Engine {
                 matmul(L.sh_up, h, sh, T);
                 k_relu2<<<nblk((int64_t) T * M.n_ff_sh), 256, 0, st>>>(sh, (int64_t) T * M.n_ff_sh);
                 matmul(L.sh_down, sh, shh, T);
+                const auto w0 = Clock::now();
                 CK(cudaEventSynchronize(ev));
+                wait_ms += ms_since(w0);
                 const auto c0 = Clock::now();
                 N::experts_forward(L.ex, *pool, xs, T, L.k, h_lat, h_ids, h_wts, h_lat_o);
                 cpu_ms += ms_since(c0);
+                if (M.lock_experts && !hot_locked) {
+                    auto& cnt = hot[l];
+                    if (cnt.empty()) cnt.assign((size_t) L.n_expert, 0);
+                    for (int p = 0; p < T * L.k; ++p) cnt[(size_t) h_ids[p]]++;
+                }
                 CK(cudaMemcpyAsync(lat_o, h_lat_o, (size_t) T * M.n_lat * 4, cudaMemcpyHostToDevice, st));
                 matmul(L.lat_up, lat_o, moe, T);
                 k_add2<<<nblk((int64_t) T * E), 256, 0, st>>>(x, moe, shh, (int64_t) T * E);
@@ -831,14 +845,74 @@ struct Engine {
         k_rms<<<1, 256, 0, st>>>(x + (size_t) (T - 1) * E, E, M.out_norm, h, E, E, M.eps);
         if (M.head_cpu) {
             CK(cudaMemcpyAsync(h_x, h, (size_t) E * 4, cudaMemcpyDeviceToHost, st));
+            const auto w0 = Clock::now();
             CK(cudaStreamSynchronize(st));
+            wait_ms += ms_since(w0);
             const auto c0 = Clock::now();
             N::dense_cpu(M.head.type, M.head_host, M.head.n_in, M.head.n_out, h_x, h_logits, *pool, head_act);
-            cpu_ms += ms_since(c0);
+            head_ms += ms_since(c0);
         } else {
             matmul(M.head, h, logits, 1);
         }
         pos += T;
+        if (M.lock_experts && !hot_locked && (seen += T) >= lock_after) lock_hot();
+    }
+
+    // --lock-experts: after the first --lock-after tokens (256), VirtualLock the most-used experts (and the CPU head) so Windows trims other
+    // programs instead of re-reading them from disk.  Locked pages are charged to the commit limit, so the budget is the
+    // commit headroom minus 12 GiB (what CFD and the rest may still allocate), capped by --lock-gib.
+    std::map<size_t, std::vector<uint32_t>> hot;
+    bool hot_locked = false;
+    int64_t seen = 0;
+    double lock_gib_cap = 1e9;
+    int64_t lock_after = 256;
+    void lock_hot() {
+        hot_locked = true;
+#if defined(_WIN32)
+        const Model& M = *m;
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        GlobalMemoryStatusEx(&ms);
+        const double head_gib = (double) ms.ullAvailPageFile / 1073741824.0;
+        double budget = std::min(lock_gib_cap, head_gib - 12.0);
+        if (budget < 1.0) {
+            std::fprintf(stderr, "strata-nemotron: no experts locked (commit headroom %.1f GiB)\n", head_gib);
+            return;
+        }
+        struct Slice { double c; const uint8_t* p; size_t n; };
+        std::vector<Slice> sl;
+        if (M.head_cpu) sl.push_back({1e30, M.head_host, (size_t) M.head.n_out * (size_t) (M.head.n_in / 32) * 34});
+        for (auto& [l, cnt] : hot) {
+            const Layer& L = M.layers[l];
+            for (int e = 0; e < L.n_expert; ++e) {
+                const double c = cnt[(size_t) e];
+                sl.push_back({c, L.ex.up + (size_t) e * L.n_ff * L.ex.up_row, (size_t) L.n_ff * L.ex.up_row});
+                sl.push_back({c, L.ex.down + (size_t) e * M.n_lat * L.ex.down_row, (size_t) M.n_lat * L.ex.down_row});
+            }
+        }
+        std::stable_sort(sl.begin(), sl.end(), [](const Slice& a, const Slice& b) { return a.c > b.c; });
+        size_t want = 0;
+        size_t take = 0;
+        for (; take < sl.size() && (double) (want + sl[take].n) / 1073741824.0 <= budget; ++take) want += sl[take].n;
+        const SIZE_T extra = (SIZE_T) 1 << 30;
+        if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), want + extra, want + 2 * extra,
+                                        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+            std::fprintf(stderr, "strata-nemotron: no experts locked (working set refused, error %lu)\n", GetLastError());
+            return;
+        }
+        size_t locked = 0;
+        double covered = 0, all = 0;
+        for (size_t i = 0; i < sl.size(); ++i) {
+            if (sl[i].c < 1e29) all += sl[i].c;
+            if (i < take && VirtualLock((LPVOID) sl[i].p, sl[i].n)) {
+                locked += sl[i].n;
+                if (sl[i].c < 1e29) covered += sl[i].c;
+            }
+        }
+        std::fprintf(stderr, "strata-nemotron: %.1f GiB of the most-used experts locked in RAM (budget %.1f GiB of %.1f GiB commit "
+                     "headroom; they served %.0f%% of the expert reads so far)\n", locked / 1073741824.0, budget, head_gib,
+                     all > 0 ? 100.0 * covered / all : 0.0);
+#endif
     }
 
     /// Reads n tokens in chunks; cb(done) after each chunk (false: stop).  Returns the tokens read.
@@ -1131,7 +1205,7 @@ int strata_nemotron_main(int argc, char** argv) {
     Model M;
     std::string err;
     try {
-        if (!load(model, M, err, head_mode, reserve)) {
+        if (!load(model, M, err, head_mode, reserve, flag(argc, argv, "--lock-experts"))) {
             std::fprintf(stderr, "strata-nemotron: %s\n", err.c_str());
             std::printf("ERR %s\n", err.c_str());
             return 1;
@@ -1143,6 +1217,8 @@ int strata_nemotron_main(int argc, char** argv) {
     }
     Engine E;
     E.init(M, ctx, chunk, threads);
+    if (const char* v = arg(argc, argv, "--lock-after")) E.lock_after = std::max(1, std::atoi(v));
+    if (const char* v = arg(argc, argv, "--lock-gib")) E.lock_gib_cap = std::atof(v);
     E.reset();
     if (flag(argc, argv, "--serve")) {
         Serve sv(E);
@@ -1162,7 +1238,7 @@ int strata_nemotron_main(int argc, char** argv) {
             E.process(toks.data(), npp, [](int64_t) { return true; });
             int nx = E.greedy();
             const double pp_ms = ms_since(t0), pp_cpu = E.cpu_ms;
-            E.cpu_ms = 0;
+            E.cpu_ms = E.head_ms = E.wait_ms = 0;
             t0 = Clock::now();
             for (int i = 0; i < ntg; ++i) {
                 const int32_t one = nx;
@@ -1170,8 +1246,10 @@ int strata_nemotron_main(int argc, char** argv) {
                 nx = E.greedy();
             }
             const double tg_ms = ms_since(t0);
-            std::printf("bench %d: pp%d %.1f tok/s (CPU experts %.0f of %.0f ms), tg%d %.2f tok/s (CPU experts %.1f ms/token)\n",
-                        rep, npp, 1000.0 * npp / pp_ms, pp_cpu, pp_ms, ntg, 1000.0 * ntg / tg_ms, E.cpu_ms / ntg);
+            std::printf("bench %d: pp%d %.1f tok/s (CPU experts %.0f of %.0f ms), tg%d %.2f tok/s = %.1f ms/token: experts %.1f, "
+                        "head %.1f, waiting for the GPU %.1f, other %.1f\n",
+                        rep, npp, 1000.0 * npp / pp_ms, pp_cpu, pp_ms, ntg, 1000.0 * ntg / tg_ms, tg_ms / ntg, E.cpu_ms / ntg,
+                        E.head_ms / ntg, E.wait_ms / ntg, (tg_ms - E.cpu_ms - E.head_ms - E.wait_ms) / ntg);
             std::fflush(stdout);
         }
         return 0;

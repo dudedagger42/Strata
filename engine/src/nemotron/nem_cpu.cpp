@@ -148,9 +148,13 @@ void experts_forward(const ExpertLayer& L, SpinPool& pool, ExpertScratch& s, int
         for (int r = 0; r < L.n_ff; r += up_chunk) up_items.push_back({e, r, std::min(L.n_ff, r + up_chunk)});
         for (int r = 0; r < L.n_lat; r += down_chunk) down_items.push_back({e, r, std::min(L.n_lat, r + down_chunk)});
     }
-    // 1. the latent inputs quantized (the up weights' activation format)
-    pool.run(nt, [&](int t) { au->fn(lat + (size_t) t * L.n_lat, s.act.data() + (size_t) t * L.up_act_bytes, L.n_lat); });
-    // 2. up + ReLU^2
+    // 1. the latent inputs quantized (the up weights' activation format); one token: here, no pool round
+    if (nt == 1) au->fn(lat, s.act.data(), L.n_lat);
+    else pool.run(nt, [&](int t) { au->fn(lat + (size_t) t * L.n_lat, s.act.data() + (size_t) t * L.up_act_bytes, L.n_lat); });
+    // 2. up + ReLU^2; the task that finishes an expert's last rows quantizes its hidden rows (no separate round)
+    std::vector<std::atomic<int>> left((size_t) L.n_expert);
+    for (auto& a : left) a.store(0, std::memory_order_relaxed);
+    for (const Item& it : up_items) left[(size_t) it.e].fetch_add(1, std::memory_order_relaxed);
     pool.run((int) up_items.size(), [&](int i) {
         const Item it = up_items[(size_t) i];
         const uint8_t* W = L.up + ((size_t) it.e * L.n_ff) * L.up_row;
@@ -166,9 +170,12 @@ void experts_forward(const ExpertLayer& L, SpinPool& pool, ExpertScratch& s, int
                 s.h[(size_t) p * L.n_ff + r] = v * v;
             }
         }
+        if (left[(size_t) it.e].fetch_sub(1, std::memory_order_acq_rel) == 1)   // 3. this expert's rows are complete
+            for (int32_t q = b0; q < b1; ++q) {
+                const int p = s.order[(size_t) q];
+                ad->fn(s.h.data() + (size_t) p * L.n_ff, s.hq.data() + (size_t) p * L.down_act_bytes, L.n_ff);
+            }
     });
-    // 3. the hidden rows quantized (the down weights' activation format)
-    pool.run(P, [&](int p) { ad->fn(s.h.data() + (size_t) p * L.n_ff, s.hq.data() + (size_t) p * L.down_act_bytes, L.n_ff); });
     // 4. down
     pool.run((int) down_items.size(), [&](int i) {
         const Item it = down_items[(size_t) i];
