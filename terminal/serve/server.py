@@ -327,6 +327,7 @@ from serve import lastrun  # noqa: E402
 from serve import hy4_kind  # noqa: E402
 from serve import hy4_dialect  # noqa: E402
 from serve import inkling_kind  # noqa: E402
+from serve import nemotron_kind  # noqa: E402
 from serve import inkling_dialect  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -762,6 +763,7 @@ class StrataEngine:
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
         self.hy4_engine = hy4_kind.is_hy4_exe(exe)     # the Hy4-Flash engine (serve/hy4_kind.py): one request at a time, no logprobs, no logit bias
+        self.nemotron_engine = nemotron_kind.is_nemotron_exe(exe)   # Nemotron-H (serve/nemotron_kind.py): one request at a time
         self.inkling_engine = inkling_kind.is_inkling_exe(exe)   # Inkling-2-Mini (serve/inkling_kind.py): 1..64 continuous batching, DSpark, in-process Vision
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -3499,7 +3501,7 @@ def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -
     """The arguments to start again with when an Auto start that picked DFlash2 ends before the engine is ready: the same start with the MTP (or no drafter, when
     the MTP layer is not on this computer). None when there is nothing to retry: the person named DFlash2 themselves (that start fails with its reason, as it
     should), the choice was not DFlash2, or the MTP arguments are the same. Builds the arguments without any line or note (engine_args announce=False)."""
-    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg):
+    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg) or nemotron_kind.is_nemotron(cfg):
         return None
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
@@ -3517,7 +3519,7 @@ def nodraft_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = Non
     """The arguments to start again with when an Auto start ends before the engine is ready because a card ran out of memory: the same start with no drafter
     (the draft layer and DFlash2's buffers are the biggest optional part on a card that is short), never the MTP in place of DFlash2.  None when the drafting
     was not Auto (the person named a drafter: that start fails with the engine's reason), when the first start has no drafter anyway, or when nothing differs."""
-    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg):
+    if hy4_kind.is_hy4(cfg) or inkling_kind.is_inkling(cfg) or nemotron_kind.is_nemotron(cfg):
         return None
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
@@ -3541,6 +3543,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         return hy4_kind.engine_args(cfg, exe, announce=announce)
     if inkling_kind.is_inkling(cfg):             # the Inkling-2-Mini engine takes its own flags (serve/inkling_kind.py)
         return inkling_kind.engine_args(cfg, exe, announce=announce)
+    if nemotron_kind.is_nemotron(cfg):           # the Nemotron-H engine takes its own flags (serve/nemotron_kind.py)
+        return nemotron_kind.engine_args(cfg, exe, announce=announce)
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
@@ -4021,6 +4025,7 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
 def refuse_for_split(engine, req: dict) -> None:
     hy4_kind.refuse(engine, req)
     inkling_kind.refuse(engine, req)
+    nemotron_kind.refuse(engine, req)
     if not getattr(engine, "split_engine", False):
         return
     if top_logprobs(req) is not None:
@@ -4143,6 +4148,8 @@ class Service:
         if self.hy4:
             self.stop_ids |= hy4_kind.end_ids(tokenizer)
             self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + hy4_kind.literal_tags(tokenizer))
+        elif getattr(engine, "nemotron_engine", False) is True:
+            self.stop_ids |= nemotron_kind.end_ids(tokenizer)
         elif self.inkling:
             self.stop_ids |= inkling_kind.end_ids(tokenizer)
             self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ())) + inkling_kind.literal_tags(tokenizer))
@@ -8755,7 +8762,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if _ds:                                             # DeepSeek: this Strata no longer runs it; stop before the engine starts (retired.py)
         print(retired.server_line(_ds), flush=True)
         return 2
-    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and not inkling_kind.is_inkling(cfg):     # (custom shape engines have no Flash-Next tuning knobs)
+    if a.config and a.engine == "strata" and not hy4_kind.is_hy4(cfg) and not inkling_kind.is_inkling(cfg) and not nemotron_kind.is_nemotron(cfg):     # (custom shape engines have no Flash-Next tuning knobs)
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None

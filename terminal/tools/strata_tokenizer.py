@@ -609,8 +609,10 @@ def extract(gguf_path, out_dir) -> dict:
         "ignore_merges": bool(getattr(tk, "ignore_merges", False)),
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": O200K_PATTERN if is_o200k else QWEN35_PATTERN,
-        "pre_pattern_source": "o200k / Inkling-2-Mini pre_tokenizer" if is_o200k else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": O200K_PATTERN if is_o200k else TEKKEN_PATTERN if tk.pre == "tekken" else QWEN35_PATTERN,
+        "pre_pattern_source": "o200k / Inkling-2-Mini pre_tokenizer" if is_o200k else
+        "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_TEKKEN)" if tk.pre == "tekken" else
+        ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
