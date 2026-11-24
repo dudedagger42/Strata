@@ -19,11 +19,15 @@ namespace strata::nemotron {
 /// A spinning pool: run(n, fn) calls fn(i) for i in [0, n) on every worker and the caller, and returns when all are done.
 class SpinPool {
 public:
-    explicit SpinPool(int threads);
+    /// pin: 0 = let Windows place the threads; 1 = one thread per logical CPU of the fastest core class (P-cores), in order;
+    /// 2 = one thread per physical core, fastest class first (no two threads on one core's hyperthreads)
+    explicit SpinPool(int threads, int pin = 0);
     ~SpinPool();
     SpinPool(const SpinPool&) = delete;
     SpinPool& operator=(const SpinPool&) = delete;
     int size() const { return n_; }
+    /// pause loops a waiting worker spins before it sleeps (WaitOnAddress) until the next run()
+    int spin = 20000;
     /// fn(task) for task in [0, tasks), work-shared; blocks until every task is done.
     void run(int tasks, const std::function<void(int)>& fn);
 
@@ -68,6 +72,11 @@ struct ExpertScratch {
 /// act: scratch for the quantized x (grown here).
 bool dense_cpu(int type, const uint8_t* W, int n_in, int n_out, const float* x, float* y, SpinPool& pool,
                std::vector<uint8_t>& act);
+
+/// One query token's attention over `nkeys` cached keys (f16 rows of HKV*128, K and V in RAM): out[H*128].  Grouped-query:
+/// H / HKV query heads share each KV head.  q is unscaled; scale multiplies the scores.
+void attn_decode(const uint16_t* K, const uint16_t* V, int nkeys, int H, int HKV, const float* q, float* out, float scale,
+                 SpinPool& pool);
 
 void experts_forward(const ExpertLayer& L, SpinPool& pool, ExpertScratch& s, int nt, int k, const float* lat,
                      const int32_t* ids, const float* w, float* out);

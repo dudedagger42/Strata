@@ -6,7 +6,14 @@
 #include "strata/quant/types.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#pragma comment(lib, "Synchronization.lib")
+#endif
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -20,13 +27,70 @@ namespace strata::nemotron {
 
 namespace Q = strata::quant;
 
-SpinPool::SpinPool(int threads) : n_(std::max(1, threads)) {
+#if defined(_WIN32)
+// CPU set ids in the order threads should take them (see SpinPool's pin)
+static std::vector<ULONG> cpu_order(int pin) {
+    std::vector<ULONG> out;
+    ULONG len = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
+    std::vector<uint8_t> buf(len);
+    if (!len || !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()), len, &len,
+                                            GetCurrentProcess(), 0))
+        return out;
+    struct C { ULONG id; int cls, core, lp; };
+    std::vector<C> cs;
+    for (ULONG off = 0; off < len;) {
+        auto* e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
+        if (e->Type == CpuSetInformation)
+            cs.push_back({e->CpuSet.Id, e->CpuSet.EfficiencyClass, e->CpuSet.CoreIndex, e->CpuSet.LogicalProcessorIndex});
+        off += e->Size;
+    }
+    int top = 0;
+    for (auto& c : cs) top = std::max(top, c.cls);
+    if (pin == 1) {
+        for (auto& c : cs)
+            if (c.cls == top) out.push_back(c.id);
+    } else {
+        // first logical CPU of each core, fastest class first, then the second hyperthreads
+        std::stable_sort(cs.begin(), cs.end(), [](const C& a, const C& b) { return a.cls > b.cls; });
+        std::vector<int> seen;
+        std::vector<ULONG> second;
+        for (auto& c : cs) {
+            if (std::find(seen.begin(), seen.end(), c.core) == seen.end()) {
+                seen.push_back(c.core);
+                out.push_back(c.id);
+            } else {
+                second.push_back(c.id);
+            }
+        }
+        out.insert(out.end(), second.begin(), second.end());
+    }
+    return out;
+}
+#endif
+
+SpinPool::SpinPool(int threads, int pin) : n_(std::max(1, threads)) {
+#if defined(_WIN32)
+    std::vector<ULONG> ids = pin ? cpu_order(pin) : std::vector<ULONG>{};
+    auto bind = [ids](int i) {
+        if (!ids.empty()) {
+            ULONG id = ids[(size_t) i % ids.size()];
+            SetThreadSelectedCpuSets(GetCurrentThread(), &id, 1);
+        }
+    };
+    bind(0);
+    for (int i = 1; i < n_; ++i) th_.emplace_back([this, i, bind] { bind(i); worker(i); });
+#else
     for (int i = 1; i < n_; ++i) th_.emplace_back([this, i] { worker(i); });
+#endif
 }
 
 SpinPool::~SpinPool() {
     quit_.store(true);
     gen_.fetch_add(1);
+#if defined(_WIN32)
+    WakeByAddressAll(&gen_);
+#endif
     for (auto& t : th_) t.join();
 }
 
@@ -36,8 +100,17 @@ void SpinPool::worker(int) {
         uint64_t g;
         int spins = 0;
         while ((g = gen_.load(std::memory_order_acquire)) == seen) {
-            if (++spins < 20000) NEM_PAUSE();
-            else std::this_thread::yield();
+            if (++spins < spin) {
+                NEM_PAUSE();
+            } else {
+#if defined(_WIN32)
+                // asleep until run() bumps gen_ (spinning cores cost a laptop its turbo budget)
+                uint64_t cur = seen;
+                WaitOnAddress(&gen_, &cur, sizeof cur, 50);
+#else
+                std::this_thread::yield();
+#endif
+            }
         }
         seen = g;
         if (quit_.load()) return;
@@ -61,6 +134,9 @@ void SpinPool::run(int tasks, const std::function<void(int)>& fn) {
     next_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
     gen_.fetch_add(1, std::memory_order_acq_rel);
+#if defined(_WIN32)
+    WakeByAddressAll(&gen_);
+#endif
     for (;;) {
         const int i = next_.fetch_add(1, std::memory_order_relaxed);
         if (i >= tasks_) break;
@@ -117,6 +193,128 @@ bool dense_cpu(int type, const uint8_t* W, int n_in, int n_out, const float* x, 
         for (int r = i * R; r < r1; ++r) kd->fn(n_in, y + r, W + (size_t) r * rb, act.data());
     });
     return true;
+}
+
+// exp for x <= 0 (softmax after the max is subtracted): Cephes-style range reduction + degree-6 polynomial, ~1e-7 relative
+static inline __m256 exp256(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.f));
+    const __m256 l2e = _mm256_set1_ps(1.44269504088896341f);
+    __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, l2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), _mm256_add_ps(x, _mm256_set1_ps(1.f)));
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
+}
+
+static inline float hsum256(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+void attn_decode(const uint16_t* K, const uint16_t* V, int nkeys, int H, int HKV, const float* q, float* out, float scale,
+                 SpinPool& pool) {
+    constexpr int HD = 128, BK = 512, GMAX = 32;
+    const int G = H / HKV, kvd = HKV * HD;
+    const int nb = (nkeys + BK - 1) / BK;
+    const int tasks = nb * HKV;
+    // per task: m[G], l[G], acc[G][HD]
+    const size_t per = (size_t) G * (HD + 2);
+    std::vector<float> part((size_t) tasks * per);
+    pool.run(tasks, [&](int ti) {
+        const int g = ti % HKV, b = ti / HKV;
+        const int k0 = b * BK, k1 = std::min(nkeys, k0 + BK), n = k1 - k0;
+        alignas(32) float s[GMAX][BK];
+        alignas(32) float qs[GMAX][HD];
+        for (int h = 0; h < G; ++h)
+            for (int c = 0; c < HD; ++c) qs[h][c] = q[(size_t) (g * G + h) * HD + c] * scale;
+        // scores
+        for (int j = 0; j < n; ++j) {
+            const uint16_t* kr = K + (size_t) (k0 + j) * kvd + g * HD;
+            __m256 kf[HD / 8];
+            for (int c = 0; c < HD / 8; ++c) kf[c] = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kr + c * 8)));
+            for (int h = 0; h < G; ++h) {
+                __m256 a0 = _mm256_mul_ps(kf[0], _mm256_load_ps(qs[h]));
+                __m256 a1 = _mm256_mul_ps(kf[1], _mm256_load_ps(qs[h] + 8));
+                for (int c = 2; c < HD / 8; c += 2) {
+                    a0 = _mm256_fmadd_ps(kf[c], _mm256_load_ps(qs[h] + c * 8), a0);
+                    a1 = _mm256_fmadd_ps(kf[c + 1], _mm256_load_ps(qs[h] + c * 8 + 8), a1);
+                }
+                s[h][j] = hsum256(_mm256_add_ps(a0, a1));
+            }
+        }
+        float* pm = part.data() + (size_t) ti * per;
+        float* pl = pm + G;
+        float* pa = pl + G;
+        for (int h = 0; h < G; ++h) {
+            float mx = -INFINITY;
+            for (int j = 0; j < n; ++j) mx = std::max(mx, s[h][j]);
+            const __m256 vm = _mm256_set1_ps(mx);
+            __m256 sum = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 8 <= n; j += 8) {
+                const __m256 e = exp256(_mm256_sub_ps(_mm256_loadu_ps(&s[h][j]), vm));
+                _mm256_storeu_ps(&s[h][j], e);
+                sum = _mm256_add_ps(sum, e);
+            }
+            float ls = hsum256(sum);
+            for (; j < n; ++j) {
+                s[h][j] = std::exp(s[h][j] - mx);
+                ls += s[h][j];
+            }
+            pm[h] = mx;
+            pl[h] = ls;
+        }
+        // acc[h] = sum_j p[h][j] V[j]
+        // 8 dims x 8 heads per pass: each V slice is converted once and feeds 8 accumulators (fits the 16 ymm registers)
+        for (int h0 = 0; h0 < G; h0 += 8) {
+            const int nh = std::min(8, G - h0);
+            for (int c = 0; c < HD / 8; ++c) {
+                __m256 acc[8];
+                for (int hh = 0; hh < 8; ++hh) acc[hh] = _mm256_setzero_ps();
+                const uint16_t* vb = V + (size_t) k0 * kvd + g * HD + c * 8;
+                if (nh == 8) {
+                    for (int jj = 0; jj < n; ++jj) {
+                        const __m256 v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(vb + (size_t) jj * kvd)));
+#pragma unroll
+                        for (int hh = 0; hh < 8; ++hh) acc[hh] = _mm256_fmadd_ps(_mm256_broadcast_ss(&s[h0 + hh][jj]), v, acc[hh]);
+                    }
+                } else {
+                    for (int jj = 0; jj < n; ++jj) {
+                        const __m256 v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(vb + (size_t) jj * kvd)));
+                        for (int hh = 0; hh < nh; ++hh) acc[hh] = _mm256_fmadd_ps(_mm256_broadcast_ss(&s[h0 + hh][jj]), v, acc[hh]);
+                    }
+                }
+                for (int hh = 0; hh < nh; ++hh) _mm256_storeu_ps(pa + (size_t) (h0 + hh) * HD + c * 8, acc[hh]);
+            }
+        }
+    });
+    // merge the blocks of each KV head
+    for (int g = 0; g < HKV; ++g)
+        for (int h = 0; h < G; ++h) {
+            float M = -INFINITY;
+            for (int b = 0; b < nb; ++b) M = std::max(M, part[(size_t) (b * HKV + g) * per + h]);
+            float L = 0.f;
+            float* o = out + (size_t) (g * G + h) * HD;
+            for (int c = 0; c < HD; ++c) o[c] = 0.f;
+            for (int b = 0; b < nb; ++b) {
+                const float* pm = part.data() + (size_t) (b * HKV + g) * per;
+                const float w = std::exp(pm[h] - M);
+                L += pm[G + h] * w;
+                const float* pa = pm + 2 * G + (size_t) h * HD;
+                for (int c = 0; c < HD; ++c) o[c] += pa[c] * w;
+            }
+            const float inv = 1.f / L;
+            for (int c = 0; c < HD; ++c) o[c] *= inv;
+        }
 }
 
 void experts_forward(const ExpertLayer& L, SpinPool& pool, ExpertScratch& s, int nt, int k, const float* lat,

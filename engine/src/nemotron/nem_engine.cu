@@ -256,6 +256,179 @@ __global__ void __launch_bounds__(128) k_attn(const float* q, const __half* kc, 
     out[(size_t) t * H * HD + h * HD + threadIdx.x] = acc / sum;
 }
 
+// Long-context attention (the KV in host RAM, streamed to the GPU in pieces): flash-style, online softmax over keys held in
+// dk/dv (cells k0 .. k0+n-1), for queries of a batch whose first token is at cell pos0.  Block per (4 queries, KV head,
+// key split) = 64 rows of (query, head), 256 threads; split z takes keys [z*sub, (z+1)*sub) of the piece and writes its
+// partial max / sum / unnormalized output to pm / pl / pa ([S][T*H], [S][T*H][128]).  k_attn_merge folds the splits into the
+// running state st_* (carried across pieces) or, on the last piece, writes out = acc / l.
+constexpr int AT_TQ = 4, AT_KT = 64, AT_HD = 128;
+constexpr int at_smem(int G) {
+    return AT_TQ * G * (AT_HD + 1) * 4 + 2 * AT_KT * (AT_HD + 2) * 2 + AT_TQ * G * (AT_KT + 1) * 4 + 3 * AT_TQ * G * 4;
+}
+template <int G>
+__global__ void __launch_bounds__(256) k_attn_tile(const float* q, const __half* dk, const __half* dv, float* pm, float* pl,
+                                                   float* pa, int H, int HKV, int pos0, int T, int k0, int n, int sub,
+                                                   float scale) {
+    constexpr int R = AT_TQ * G, QS = AT_HD + 1, KS = AT_HD + 2, SS = AT_KT + 1;
+    constexpr int RPT = R / 2;   // rows per thread in the output update (2 halves of 128 threads)
+    extern __shared__ __align__(16) unsigned char at_sm[];
+    float* qs = reinterpret_cast<float*>(at_sm);
+    __half* ks = reinterpret_cast<__half*>(qs + R * QS);
+    __half* vs = ks + AT_KT * KS;
+    float* S = reinterpret_cast<float*>(vs + AT_KT * KS);
+    float* rm = S + R * SS;
+    float* rl = rm + R;
+    float* ra = rl + R;
+    const int tid = threadIdx.x, g = blockIdx.y, z = blockIdx.z, kvd = HKV * AT_HD;
+    const int tq0 = blockIdx.x * AT_TQ;
+    auto row_t = [&](int r) { return tq0 + r / G; };
+    auto row_h = [&](int r) { return g * G + r % G; };
+    for (int i = tid; i < R * AT_HD; i += 256) {
+        const int r = i / AT_HD, c = i % AT_HD, t = row_t(r);
+        qs[r * QS + c] = t < T ? q[(size_t) t * H * AT_HD + row_h(r) * AT_HD + c] * scale : 0.f;
+    }
+    for (int i = tid; i < R; i += 256) rm[i] = -INFINITY, rl[i] = 0.f;
+    const int d = tid & 127, half = tid >> 7;
+    float acc[RPT];
+#pragma unroll
+    for (int rr = 0; rr < RPT; ++rr) acc[rr] = 0.f;
+    // this split's keys, cut at the last key any query of the block may see
+    const int kmax = pos0 + min(tq0 + AT_TQ, T) - 1;
+    const int kb = z * sub;
+    const int ke = min(min(n, kb + sub), kmax - k0 + 1);
+    for (int kt = kb; kt < ke; kt += AT_KT) {
+        __syncthreads();
+        for (int i = tid; i < AT_KT * (AT_HD / 2); i += 256) {
+            const int j = i / (AT_HD / 2), c2 = i % (AT_HD / 2);
+            __half2 kv2 = __float2half2_rn(0.f), vv2 = kv2;
+            if (kt + j < ke) {
+                kv2 = reinterpret_cast<const __half2*>(dk + (size_t) (kt + j) * kvd + g * AT_HD)[c2];
+                vv2 = reinterpret_cast<const __half2*>(dv + (size_t) (kt + j) * kvd + g * AT_HD)[c2];
+            }
+            reinterpret_cast<__half2*>(ks + j * KS)[c2] = kv2;
+            reinterpret_cast<__half2*>(vs + j * KS)[c2] = vv2;
+        }
+        __syncthreads();
+        // scores: row r = tid / 4, keys j = tid % 4 + 4 i
+        {
+            const int r = tid >> 2, j0 = tid & 3;
+            const int t = row_t(r), qa = pos0 + t;
+            float s[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) s[i] = 0.f;
+            for (int c = 0; c < AT_HD; c += 2) {
+                const float q0 = qs[r * QS + c], q1 = qs[r * QS + c + 1];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const float2 kf = __half22float2(reinterpret_cast<const __half2*>(ks + (j0 + 4 * i) * KS)[c / 2]);
+                    s[i] += q0 * kf.x + q1 * kf.y;
+                }
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int j = j0 + 4 * i, key = k0 + kt + j;
+                if (t >= T || kt + j >= ke || key > qa) s[i] = -INFINITY;
+                mx = fmaxf(mx, s[i]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float mo = rm[r];
+            const float mn = fmaxf(mo, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const float p = mn == -INFINITY ? 0.f : __expf(s[i] - mn);
+                S[r * SS + j0 + 4 * i] = p;
+                sum += p;
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            __syncwarp();
+            if (j0 == 0) {
+                const float a = mn == -INFINITY ? 1.f : __expf(mo - mn);
+                ra[r] = a;
+                rl[r] = rl[r] * a + sum;
+                rm[r] = mn;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int rr = 0; rr < RPT; ++rr) acc[rr] *= ra[half * RPT + rr];
+        for (int j = 0; j < AT_KT; ++j) {
+            const float v = __half2float(vs[j * KS + d]);
+#pragma unroll
+            for (int rr = 0; rr < RPT; ++rr) acc[rr] += S[(half * RPT + rr) * SS + j] * v;
+        }
+    }
+    __syncthreads();
+    const size_t base = (size_t) z * T * H;
+#pragma unroll
+    for (int rr = 0; rr < RPT; ++rr) {
+        const int r = half * RPT + rr, t = row_t(r);
+        if (t < T) pa[(base + (size_t) t * H + row_h(r)) * AT_HD + d] = acc[rr];
+    }
+    for (int i = tid; i < R; i += 256) {
+        const int t = row_t(i);
+        if (t < T) pm[base + (size_t) t * H + row_h(i)] = rm[i], pl[base + (size_t) t * H + row_h(i)] = rl[i];
+    }
+}
+
+// fold S split partials (and, unless first, the running state) of each (query, head) row; block per row, 128 threads
+__global__ void __launch_bounds__(128) k_attn_merge(const float* pm, const float* pl, const float* pa, float* st_m, float* st_l,
+                                                    float* st_acc, float* out, int rows, int S, bool first, bool last) {
+    const int r = blockIdx.x, d = threadIdx.x;
+    float M = first ? -INFINITY : st_m[r];
+    for (int z = 0; z < S; ++z) M = fmaxf(M, pm[(size_t) z * rows + r]);
+    float L = 0.f, A = 0.f;
+    if (!first && M != -INFINITY) {
+        const float w = __expf(st_m[r] - M);
+        L = st_l[r] * w;
+        A = st_acc[(size_t) r * AT_HD + d] * w;
+    }
+    for (int z = 0; z < S; ++z) {
+        const float m = pm[(size_t) z * rows + r];
+        if (m == -INFINITY) continue;
+        const float w = __expf(m - M);
+        L += pl[(size_t) z * rows + r] * w;
+        A += pa[((size_t) z * rows + r) * AT_HD + d] * w;
+    }
+    if (last) {
+        out[(size_t) r * AT_HD + d] = A / L;
+    } else {
+        __syncthreads();
+        st_acc[(size_t) r * AT_HD + d] = A;
+        if (d == 0) st_m[r] = M, st_l[r] = L;
+    }
+}
+
+// The host-KV attention of T queries over cells 0 .. pos+T-1: each piece copied in, split over enough blocks to fill the GPU,
+// merged.  Scratch: pm/pl [cap_rows*H], pa [cap_rows*H][128] (cap_rows >= T), st_* the carried state [T*H](x128).
+constexpr int AT_CAP_ROWS = 1024;
+static void attn_hostkv_gpu(const float* q, float* out, const __half* hk, const __half* hv, __half* dk, __half* dv, int piece,
+                            float* pm, float* pl, float* pa, float* sm, float* sl, float* sa, int H, int HKV, int pos, int T,
+                            bool sync_copies, cudaStream_t st) {
+    const int kvd = HKV * AT_HD, nkeys = pos + T;
+    const float scale = 1.0f / std::sqrt((float) AT_HD);
+    const int bx = (T + AT_TQ - 1) / AT_TQ, blocks = bx * HKV;
+    for (int k0 = 0; k0 < nkeys; k0 += piece) {
+        const int n = std::min(piece, nkeys - k0);
+        if (sync_copies) {
+            CK(cudaMemcpy(dk, hk + (size_t) k0 * kvd, (size_t) n * kvd * 2, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dv, hv + (size_t) k0 * kvd, (size_t) n * kvd * 2, cudaMemcpyHostToDevice));
+        } else {
+            CK(cudaMemcpyAsync(dk, hk + (size_t) k0 * kvd, (size_t) n * kvd * 2, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(dv, hv + (size_t) k0 * kvd, (size_t) n * kvd * 2, cudaMemcpyHostToDevice, st));
+        }
+        int S = std::max(1, std::min({(144 + blocks - 1) / blocks, (n + 255) / 256, AT_CAP_ROWS / T}));
+        const int sub = ((n + S - 1) / S + AT_KT - 1) / AT_KT * AT_KT;
+        S = (n + sub - 1) / sub;
+        k_attn_tile<16><<<dim3((unsigned) bx, (unsigned) HKV, (unsigned) S), 256, at_smem(16), st>>>(q, dk, dv, pm, pl, pa, H, HKV,
+                                                                                                  pos, T, k0, n, sub, scale);
+        k_attn_merge<<<T * H, 128, 0, st>>>(pm, pl, pa, sm, sl, sa, out, T * H, S, k0 == 0, k0 + n >= nkeys);
+    }
+}
+
 // logits[t][e] = W[e] . x[t] (f32 router; grid (E, T), block 128)
 __global__ void k_gemv_f32(const float* W, const float* x, int ldx, float* y, int n_in, int n_out) {
     __shared__ float sh[32];
@@ -652,6 +825,15 @@ struct Engine {
     // per-layer state
     std::vector<float*> conv_st, ssm_st;
     std::vector<__half*> kc, vc;
+    // long context: the KV of each attention layer in pinned host RAM (hk/hv), streamed through dk/dv in pieces
+    bool kv_host = false;
+    int piece = 32768;
+    std::vector<__half*> hk, hv;
+    __half *dk = nullptr, *dv = nullptr, *nk = nullptr, *nv = nullptr;
+    float *at_m = nullptr, *at_l = nullptr, *at_acc = nullptr, *at_pm = nullptr, *at_pl = nullptr, *at_pa = nullptr;
+    float *h_q = nullptr, *h_y = nullptr;
+    bool gpu_decode = false;   // --kv-host-gpu-decode: one-token attention on the GPU too (for comparison)
+    double attn_ms = 0;        // one-token attention on the CPU
     // scratch (chunk rows)
     float *x = nullptr, *h = nullptr, *zx = nullptr, *xbc = nullptr, *y = nullptr, *o = nullptr, *q = nullptr, *kk = nullptr,
           *vv = nullptr, *sc = nullptr, *lat = nullptr, *lat_o = nullptr, *moe = nullptr, *sh = nullptr, *shh = nullptr,
@@ -664,36 +846,54 @@ struct Engine {
     int32_t *h_ids = nullptr, *h_amax = nullptr;
     double cpu_ms = 0, head_ms = 0, wait_ms = 0;   // routed experts on the CPU, the head on the CPU, waiting for the GPU
 
-    void init(Model& model, int ctx_, int chunk_, int threads) {
+    void init(Model& model, int ctx_, int chunk_, int threads, bool kv_host_, int pin = 0) {
         m = &model;
         ctx = ctx_;
         chunk = chunk_;
+        kv_host = kv_host_;
+        piece = std::min(ctx, piece);
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-        pool = std::make_unique<N::SpinPool>(threads);
+        pool = std::make_unique<N::SpinPool>(threads, pin);
         const Model& M = *m;
         const int C = M.d_inner + 2 * M.n_group * M.d_state;
         const int dproj = 2 * M.d_inner + 2 * M.n_group * M.d_state + M.n_ssm_head;
-        size_t state_bytes = 0;
+        size_t state_bytes = 0, kv_host_bytes = 0;
         for (const Layer& L : M.layers) {
             if (L.kind == Kind::Mamba) {
                 conv_st.push_back(dalloc<float>((size_t) C * 3));
                 ssm_st.push_back(dalloc<float>((size_t) M.n_ssm_head * (M.d_inner / M.n_ssm_head) * M.d_state));
                 kc.push_back(nullptr);
                 vc.push_back(nullptr);
+                hk.push_back(nullptr);
+                hv.push_back(nullptr);
                 state_bytes += (size_t) C * 12 + (size_t) M.d_inner * M.d_state * 4;
             } else if (L.kind == Kind::Attn) {
                 const size_t kvd = (size_t) L.n_head_kv * M.head_dim;
                 conv_st.push_back(nullptr);
                 ssm_st.push_back(nullptr);
-                kc.push_back(dalloc<__half>((size_t) ctx * kvd));
-                vc.push_back(dalloc<__half>((size_t) ctx * kvd));
-                state_bytes += (size_t) ctx * kvd * 4;
+                if (kv_host) {
+                    kc.push_back(nullptr);
+                    vc.push_back(nullptr);
+                    hk.push_back(halloc<__half>((size_t) ctx * kvd));
+                    hv.push_back(halloc<__half>((size_t) ctx * kvd));
+                    std::memset(hk.back(), 0, (size_t) ctx * kvd * 2);
+                    std::memset(hv.back(), 0, (size_t) ctx * kvd * 2);
+                    kv_host_bytes += (size_t) ctx * kvd * 4;
+                } else {
+                    kc.push_back(dalloc<__half>((size_t) ctx * kvd));
+                    vc.push_back(dalloc<__half>((size_t) ctx * kvd));
+                    hk.push_back(nullptr);
+                    hv.push_back(nullptr);
+                    state_bytes += (size_t) ctx * kvd * 4;
+                }
             } else {
                 conv_st.push_back(nullptr);
                 ssm_st.push_back(nullptr);
                 kc.push_back(nullptr);
                 vc.push_back(nullptr);
+                hk.push_back(nullptr);
+                hv.push_back(nullptr);
             }
         }
         int max_e = 0, max_k = 0;
@@ -709,7 +909,26 @@ struct Engine {
         kk = dalloc<float>(T * 1024);
         vv = dalloc<float>(T * 1024);
         sc_q = (int) std::max<int64_t>(1, std::min<int64_t>((int64_t) T, (int64_t) (64ll << 20) / (4ll * M.n_head * ctx)));
-        sc = dalloc<float>((size_t) sc_q * M.n_head * ctx);
+        if (kv_host) {
+            int kvd_max = 0;
+            for (const Layer& L : M.layers)
+                if (L.kind == Kind::Attn) kvd_max = std::max(kvd_max, L.n_head_kv * M.head_dim);
+            dk = dalloc<__half>((size_t) piece * kvd_max);
+            dv = dalloc<__half>((size_t) piece * kvd_max);
+            nk = dalloc<__half>(T * kvd_max);
+            nv = dalloc<__half>(T * kvd_max);
+            at_m = dalloc<float>(T * M.n_head);
+            at_l = dalloc<float>(T * M.n_head);
+            at_acc = dalloc<float>(T * M.n_head * M.head_dim);
+            at_pm = dalloc<float>((size_t) AT_CAP_ROWS * M.n_head);
+            at_pl = dalloc<float>((size_t) AT_CAP_ROWS * M.n_head);
+            at_pa = dalloc<float>((size_t) AT_CAP_ROWS * M.n_head * M.head_dim);
+            h_q = halloc<float>((size_t) M.n_head * M.head_dim);
+            h_y = halloc<float>((size_t) M.n_head * M.head_dim);
+            CK(cudaFuncSetAttribute(k_attn_tile<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, at_smem(16)));
+        } else {
+            sc = dalloc<float>((size_t) sc_q * M.n_head * ctx);
+        }
         lat = dalloc<float>(T * M.n_lat);
         lat_o = dalloc<float>(T * M.n_lat);
         moe = dalloc<float>(T * M.n_embd);
@@ -733,8 +952,8 @@ struct Engine {
         h_amax = halloc<int32_t>(1);
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
-        std::fprintf(stderr, "strata-nemotron: context %d, chunk %d, %d CPU threads; state + KV %.0f MiB; %.0f MiB of VRAM free\n",
-                     ctx, chunk, threads, state_bytes / 1048576.0, fr / 1048576.0);
+        std::fprintf(stderr, "strata-nemotron: context %d, chunk %d, %d CPU threads; state + KV %.0f MiB on the GPU, KV %.0f MiB in RAM; %.0f MiB of VRAM free\n",
+                     ctx, chunk, threads, state_bytes / 1048576.0, kv_host_bytes / 1048576.0, fr / 1048576.0);
     }
 
     void reset() {
@@ -779,6 +998,31 @@ struct Engine {
         CK(cudaMemcpyAsync(x, h_x, (size_t) T * M.n_embd * 4, cudaMemcpyHostToDevice, st));
     }
 
+    // attention with the KV in host RAM: the new rows appended there, then every key streamed through dk/dv in pieces
+    void attn_host(size_t l, const Layer& L, int T) {
+        const Model& M = *m;
+        const int kvd = L.n_head_kv * M.head_dim;
+        k_kv_put<<<nblk((int64_t) T * kvd), 256, 0, st>>>(kk, vv, nk, nv, kvd, T, 0);
+        CK(cudaMemcpyAsync(hk[l] + (size_t) pos * kvd, nk, (size_t) T * kvd * 2, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(hv[l] + (size_t) pos * kvd, nv, (size_t) T * kvd * 2, cudaMemcpyDeviceToHost, st));
+        if (T == 1 && !gpu_decode) {
+            // one token: attention on the CPU straight from RAM (no PCIe copy of the whole cache)
+            CK(cudaMemcpyAsync(h_q, q, (size_t) M.n_head * M.head_dim * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev, st));
+            const auto w0 = Clock::now();
+            CK(cudaEventSynchronize(ev));
+            wait_ms += ms_since(w0);
+            const auto c0 = Clock::now();
+            N::attn_decode(reinterpret_cast<const uint16_t*>(hk[l]), reinterpret_cast<const uint16_t*>(hv[l]), pos + 1, M.n_head,
+                           L.n_head_kv, h_q, h_y, 1.0f / std::sqrt((float) M.head_dim), *pool);
+            attn_ms += ms_since(c0);
+            CK(cudaMemcpyAsync(y, h_y, (size_t) M.n_head * M.head_dim * 4, cudaMemcpyHostToDevice, st));
+            return;
+        }
+        attn_hostkv_gpu(q, y, hk[l], hv[l], dk, dv, piece, at_pm, at_pl, at_pa, at_m, at_l, at_acc, M.n_head, L.n_head_kv, pos, T,
+                        false, st);
+    }
+
     // one chunk of T tokens through every layer; the last token's logits into `logits`
     void forward(const int32_t* toks, int T) {
         const Model& M = *m;
@@ -804,11 +1048,15 @@ struct Engine {
                 matmul(L.wq, h, q, T);
                 matmul(L.wk, h, kk, T);
                 matmul(L.wv, h, vv, T);
-                k_kv_put<<<nblk((int64_t) T * kvd), 256, 0, st>>>(kk, vv, kc[l], vc[l], kvd, T, pos);
-                for (int t0 = 0; t0 < T; t0 += sc_q) {
-                    const int nq = std::min(sc_q, T - t0);
-                    k_attn<<<nq * M.n_head, 128, 0, st>>>(q, kc[l], vc[l], y, sc, M.n_head, L.n_head_kv, pos, t0, ctx,
-                                                          1.0f / std::sqrt((float) M.head_dim));
+                if (kv_host) {
+                    attn_host(l, L, T);
+                } else {
+                    k_kv_put<<<nblk((int64_t) T * kvd), 256, 0, st>>>(kk, vv, kc[l], vc[l], kvd, T, pos);
+                    for (int t0 = 0; t0 < T; t0 += sc_q) {
+                        const int nq = std::min(sc_q, T - t0);
+                        k_attn<<<nq * M.n_head, 128, 0, st>>>(q, kc[l], vc[l], y, sc, M.n_head, L.n_head_kv, pos, t0, ctx,
+                                                              1.0f / std::sqrt((float) M.head_dim));
+                    }
                 }
                 matmul(L.wo, y, o, T);
                 k_add<<<nblk((int64_t) T * E), 256, 0, st>>>(x, o, (int64_t) T * E);
@@ -1182,6 +1430,89 @@ bool flag(int argc, char** argv, const char* name) {
 }  // namespace
 
 int strata_nemotron_main(int argc, char** argv) {
+    if (const char* ba = arg(argc, argv, "--bench-attn")) {
+        // one-token CPU attention over N cached keys, 8 layers' worth (no model, no GPU)
+        const int nkeys = std::atoi(ba), H = 32, HKV = 2, kvd = HKV * 128;
+        const int th = arg(argc, argv, "--threads") ? std::atoi(arg(argc, argv, "--threads")) : 16;
+        std::vector<uint16_t> K((size_t) nkeys * kvd * 8), V(K.size());
+        for (size_t i = 0; i < K.size(); ++i) K[i] = V[i] = (uint16_t) (0x3000 + (i * 2654435761u >> 20) % 0x800);
+        std::vector<float> q(H * 128, 0.01f), out(H * 128);
+        N::SpinPool pool(th);
+        for (int rep = 0; rep < 3; ++rep) {
+            const auto t0 = Clock::now();
+            for (int l = 0; l < 8; ++l)
+                N::attn_decode(K.data() + (size_t) l * nkeys * kvd, V.data() + (size_t) l * nkeys * kvd, nkeys, H, HKV, q.data(),
+                               out.data(), 0.088f, pool);
+            std::printf("attention, %d keys x 8 layers, %d threads: %.1f ms\n", nkeys, th, ms_since(t0));
+        }
+        return 0;
+    }
+    if (flag(argc, argv, "--selftest-attn")) {
+        // the pieced host-KV kernel against k_attn on random data (several pieces, a partial last tile)
+        const int H = 32, HKV = 2, HD = 128, kvd = HKV * HD;
+        int worst_fail = 0;
+        for (int cfg = 0; cfg < 4; ++cfg) {
+            const int T = cfg == 0 ? 1 : cfg == 1 ? 7 : cfg == 2 ? 133 : 1, pos = cfg == 0 ? 300 : cfg == 1 ? 250 : cfg == 2 ? 61 : 9000,
+                      piece = cfg == 2 ? 1000 : cfg == 3 ? 4096 : 97;
+            const int nkeys = pos + T, ctx = nkeys;
+            std::vector<float> hq((size_t) T * H * HD);
+            std::vector<__half> hkc((size_t) ctx * kvd), hvc((size_t) ctx * kvd);
+            uint32_t s = 12345 + cfg;
+            auto rnd = [&] { s = s * 1664525u + 1013904223u; return ((s >> 8) & 0xffff) / 32768.f - 1.f; };
+            for (auto& v : hq) v = rnd() * 3.f;
+            for (auto& v : hkc) v = __float2half(rnd());
+            for (auto& v : hvc) v = __float2half(rnd());
+            float *q, *y0, *y1, *sc, *am, *al, *aa;
+            __half *kc, *vc, *dk, *dv;
+            CK(cudaMalloc(&q, hq.size() * 4));
+            CK(cudaMalloc(&y0, hq.size() * 4));
+            CK(cudaMalloc(&y1, hq.size() * 4));
+            CK(cudaMalloc(&sc, (size_t) T * H * ctx * 4));
+            CK(cudaMalloc(&am, (size_t) T * H * 4));
+            CK(cudaMalloc(&al, (size_t) T * H * 4));
+            CK(cudaMalloc(&aa, (size_t) T * H * HD * 4));
+            CK(cudaMalloc(&kc, hkc.size() * 2));
+            CK(cudaMalloc(&vc, hvc.size() * 2));
+            CK(cudaMalloc(&dk, (size_t) piece * kvd * 2));
+            CK(cudaMalloc(&dv, (size_t) piece * kvd * 2));
+            CK(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(kc, hkc.data(), hkc.size() * 2, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(vc, hvc.data(), hvc.size() * 2, cudaMemcpyHostToDevice));
+            const float scale = 1.0f / std::sqrt((float) HD);
+            k_attn<<<T * H, 128>>>(q, kc, vc, y0, sc, H, HKV, pos, 0, ctx, scale);
+            CK(cudaFuncSetAttribute(k_attn_tile<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, at_smem(16)));
+            float *pm, *pl, *pa;
+            CK(cudaMalloc(&pm, (size_t) AT_CAP_ROWS * H * 4));
+            CK(cudaMalloc(&pl, (size_t) AT_CAP_ROWS * H * 4));
+            CK(cudaMalloc(&pa, (size_t) AT_CAP_ROWS * H * HD * 4));
+            attn_hostkv_gpu(q, y1, hkc.data(), hvc.data(), dk, dv, piece, pm, pl, pa, am, al, aa, H, HKV, pos, T, true, 0);
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+            std::vector<float> a(hq.size()), b(hq.size());
+            CK(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost));
+            auto cmp = [&](const char* what, const std::vector<float>& u) {
+                double mx = 0, ma = 0;
+                for (size_t i = 0; i < a.size(); ++i) mx = std::max(mx, (double) std::fabs(a[i] - u[i])), ma = std::max(ma, (double) std::fabs(a[i]));
+                std::printf("attn selftest %s T=%d pos=%d piece=%d: max |diff| %.3g (max |y| %.3g)\n", what, T, pos, piece, mx, ma);
+                if (!(mx < 1e-4)) worst_fail = 1;
+            };
+            cmp("gpu", b);
+            if (T == 1) {
+                N::SpinPool pool(8);
+                std::vector<float> c(hq.size());
+                N::attn_decode(reinterpret_cast<const uint16_t*>(hkc.data()), reinterpret_cast<const uint16_t*>(hvc.data()), nkeys, H,
+                               HKV, hq.data(), c.data(), scale, pool);
+                cmp("cpu", c);
+            }
+            cudaFree(pm), cudaFree(pl), cudaFree(pa);
+            for (void* p : {(void*) q, (void*) y0, (void*) y1, (void*) sc, (void*) am, (void*) al, (void*) aa, (void*) kc, (void*) vc,
+                            (void*) dk, (void*) dv})
+                cudaFree(p);
+        }
+        std::printf(worst_fail ? "FAIL\n" : "OK\n");
+        return worst_fail;
+    }
     const char* model = arg(argc, argv, "--native");
     if (!model) model = arg(argc, argv, "--model");
     if (!model || flag(argc, argv, "--help")) {
@@ -1201,7 +1532,9 @@ int strata_nemotron_main(int argc, char** argv) {
     int head_mode = -1;
     if (const char* v = arg(argc, argv, "--head")) head_mode = std::strcmp(v, "cpu") == 0 ? 1 : std::strcmp(v, "gpu") == 0 ? 0 : -1;
     // what the engine allocates after the weights: the Mamba state, the KV (f16), the chunk scratch, the CUDA libraries
-    const size_t reserve = 450 + (size_t) ctx * 16 / 1024 + (size_t) chunk * 1;
+    // --kv-host (or a context over 16k): the KV in RAM, only a 32k-token staging piece on the GPU
+    const bool kv_host = flag(argc, argv, "--kv-host") || (ctx > 16384 && !flag(argc, argv, "--kv-gpu"));
+    const size_t reserve = 450 + (kv_host ? 48 : (size_t) ctx * 16 / 1024) + (size_t) chunk * 1;
     Model M;
     std::string err;
     try {
@@ -1216,7 +1549,11 @@ int strata_nemotron_main(int argc, char** argv) {
         return 1;
     }
     Engine E;
-    E.init(M, ctx, chunk, threads);
+    const char* pv = arg(argc, argv, "--pin");
+    const int pin = !pv ? 0 : std::strcmp(pv, "p") == 0 ? 1 : std::strcmp(pv, "cores") == 0 ? 2 : 0;
+    E.init(M, ctx, chunk, threads, kv_host, pin);
+    E.gpu_decode = flag(argc, argv, "--kv-host-gpu-decode");
+    if (const char* v = arg(argc, argv, "--spin")) E.pool->spin = std::max(0, std::atoi(v));
     if (const char* v = arg(argc, argv, "--lock-after")) E.lock_after = std::max(1, std::atoi(v));
     if (const char* v = arg(argc, argv, "--lock-gib")) E.lock_gib_cap = std::atof(v);
     E.reset();
@@ -1233,12 +1570,16 @@ int strata_nemotron_main(int argc, char** argv) {
         for (auto& t : toks) t = 1000 + (int) (r() % 50000);
         for (int rep = 0; rep < reps; ++rep) {
             E.reset();
+            // --bench-pp-at N: the prompt starts at cell N (prefill timing deep into a long context; the KV before it is filler)
+            if (const char* ppat = arg(argc, argv, "--bench-pp-at")) E.pos = std::min(std::atoi(ppat), E.ctx - npp - ntg - 1);
             E.cpu_ms = 0;
             auto t0 = Clock::now();
             E.process(toks.data(), npp, [](int64_t) { return true; });
             int nx = E.greedy();
             const double pp_ms = ms_since(t0), pp_cpu = E.cpu_ms;
-            E.cpu_ms = E.head_ms = E.wait_ms = 0;
+            // --bench-pos N: time decode as if N tokens came before (attention over N cells; timing only, the KV is filler)
+            if (const char* bpos = arg(argc, argv, "--bench-pos")) E.pos = std::max(E.pos, std::min(std::atoi(bpos), E.ctx - ntg - 1));
+            E.cpu_ms = E.head_ms = E.wait_ms = E.attn_ms = 0;
             t0 = Clock::now();
             for (int i = 0; i < ntg; ++i) {
                 const int32_t one = nx;
@@ -1247,9 +1588,10 @@ int strata_nemotron_main(int argc, char** argv) {
             }
             const double tg_ms = ms_since(t0);
             std::printf("bench %d: pp%d %.1f tok/s (CPU experts %.0f of %.0f ms), tg%d %.2f tok/s = %.1f ms/token: experts %.1f, "
-                        "head %.1f, waiting for the GPU %.1f, other %.1f\n",
+                        "head %.1f, attention on the CPU %.1f, waiting for the GPU %.1f, other %.1f (at cell %d)\n",
                         rep, npp, 1000.0 * npp / pp_ms, pp_cpu, pp_ms, ntg, 1000.0 * ntg / tg_ms, tg_ms / ntg, E.cpu_ms / ntg,
-                        E.head_ms / ntg, E.wait_ms / ntg, (tg_ms - E.cpu_ms - E.head_ms - E.wait_ms) / ntg);
+                        E.head_ms / ntg, E.attn_ms / ntg, E.wait_ms / ntg,
+                        (tg_ms - E.cpu_ms - E.head_ms - E.attn_ms - E.wait_ms) / ntg, E.pos);
             std::fflush(stdout);
         }
         return 0;
