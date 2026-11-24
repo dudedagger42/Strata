@@ -843,6 +843,25 @@ if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
 
+# ---- strata-nemotron: NVIDIA Nemotron-H MoE (nemotron_h_moe, e.g. Nemotron 3.5 Bolt 74B-A9B), src/nemotron ----
+# The dense layers on the GPU, the routed latent experts in RAM on the CPU. OFF by default (opt-in, CUDA only).
+option(STRATA_BUILD_NEMOTRON "Build strata-nemotron: Nemotron-H MoE engine (CUDA, experts on the CPU)" OFF)
+if(STRATA_BUILD_NEMOTRON)
+  if(NOT STRATA_ENABLE_CUDA OR NOT TARGET strata_quant)
+    message(FATAL_ERROR "STRATA_BUILD_NEMOTRON requires STRATA_ENABLE_CUDA=ON and STRATA_NATIVE_EXPERTS=ON")
+  endif()
+  add_executable(strata-nemotron src/nemotron/nem_main.cpp src/nemotron/nem_engine.cu src/nemotron/nem_cpu.cpp)
+  strata_utf8_manifest(strata-nemotron)
+  target_include_directories(strata-nemotron PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(strata-nemotron PRIVATE strata_kernels strata_quant strata_artifact ${_strata_gpu_runtime_target}
+                        Threads::Threads)
+  if(MSVC)
+    set_source_files_properties(src/nemotron/nem_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/nemotron/nem_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  endif()
+endif()
+
 # ---- strata-hy4: Tencent Hy4-Flash 220B-A12B .strata engine (src/hy4flash/run, CUDA sm_70+ or HIP) ----
 # OFF by default so existing CI presets stay unchanged; unified CMake build alongside strata / strata-q36 / strata-split / strata-inkling.
 option(STRATA_BUILD_HY4 "Build strata-hy4: Tencent Hy4-Flash .strata engine (CUDA or HIP)" OFF)

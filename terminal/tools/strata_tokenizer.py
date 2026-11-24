@@ -114,6 +114,20 @@ QWEN2_PATTERN = (
 )
 
 
+# The `tekken` pre-tokenizer (Mistral Tekken; NVIDIA Nemotron-H; llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN, the original
+# tokenizer.json regex quoted in src/llama-vocab.cpp).  llama.cpp runs it with ignore_merges: a piece that is a whole
+# vocabulary token is that token.
+TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -149,6 +163,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "deepseek3"
     if p in O200K_PRES:
         return "o200k"
+    if p == "tekken":
+        return "tekken"
     return None
 
 
@@ -157,7 +173,7 @@ class Tokenizer:
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
         self.pre = pre
-        self.ignore_merges = pre in O200K_PRES
+        self.ignore_merges = pre in O200K_PRES or pre == "tekken"
         if pre_tokenizer_kind(pre) is None:
             # Not a fallback: another model's pre-tokenizer splits text differently, so encoding with the qwen35 rule would
             # change every prompt without any error (llama.cpp has one rule per `tokenizer.ggml.pre` type for the same reason).
@@ -185,6 +201,9 @@ class Tokenizer:
             self._split = lambda text: _sequence_findall(seq, text)
         elif pre_tokenizer_kind(pre) == "o200k":
             self._re = regex.compile(O200K_PATTERN)
+            self._split = self._re.findall
+        elif pre_tokenizer_kind(pre) == "tekken":
+            self._re = regex.compile(TEKKEN_PATTERN)
             self._split = self._re.findall
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
